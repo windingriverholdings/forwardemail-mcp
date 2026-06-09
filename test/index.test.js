@@ -2,6 +2,8 @@ const test = require('node:test');
 const assert = require('node:assert');
 const {spawn} = require('node:child_process');
 const path = require('node:path');
+const axios = require('axios');
+const {getTools} = require('../lib/tools.js');
 
 const cliPath = path.resolve(__dirname, '../bin/mcp-server.js');
 
@@ -427,6 +429,519 @@ test('MCP Server', async (t) => {
       }
     },
   );
+
+  //
+  // Input schema verification
+  //
+  await t.test(
+    'every tool has an inputSchema with type object and properties',
+    async () => {
+      const child = runCli();
+      try {
+        await initializeServer(child);
+        const result = await listTools(child);
+
+        for (const tool of result.tools) {
+          assert(tool.inputSchema, `${tool.name} missing inputSchema`);
+          assert.strictEqual(
+            tool.inputSchema.type,
+            'object',
+            `${tool.name} inputSchema.type should be "object"`,
+          );
+          assert(
+            tool.inputSchema.properties &&
+              typeof tool.inputSchema.properties === 'object',
+            `${tool.name} missing inputSchema.properties`,
+          );
+        }
+      } finally {
+        killChild(child);
+      }
+    },
+  );
+
+  await t.test('every tool has a required array in inputSchema', async () => {
+    const child = runCli();
+    try {
+      await initializeServer(child);
+      const result = await listTools(child);
+
+      for (const tool of result.tools) {
+        assert(
+          Array.isArray(tool.inputSchema.required),
+          `${tool.name} missing or non-array inputSchema.required`,
+        );
+      }
+    } finally {
+      killChild(child);
+    }
+  });
+
+  await t.test(
+    'tools with path params have those params in required',
+    async () => {
+      const child = runCli();
+      try {
+        await initializeServer(child);
+        const result = await listTools(child);
+
+        // Tools with known path params and their expected required path params
+        const toolsWithPathParameters = {
+          getDomain: ['domain_id'],
+          updateDomain: ['domain_id'],
+          deleteDomain: ['domain_id'],
+          verifyDomainRecords: ['domain_id'],
+          verifySmtpRecords: ['domain_id'],
+          testS3Connection: ['domain_id'],
+          listCatchAllPasswords: ['domain_id'],
+          createCatchAllPassword: ['domain_id'],
+          deleteCatchAllPassword: ['domain_id', 'token_id'],
+          updateDomainMember: ['domain_id', 'member_id'],
+          removeDomainMember: ['domain_id', 'member_id'],
+          listAliases: ['domain_id'],
+          createAlias: ['domain_id'],
+          getAlias: ['domain_id', 'alias_id'],
+          updateAlias: ['domain_id', 'alias_id'],
+          deleteAlias: ['domain_id', 'alias_id'],
+          generateAliasPassword: ['domain_id', 'alias_id'],
+          listSieveScripts: ['domain_id', 'alias_id'],
+          createSieveScript: ['domain_id', 'alias_id'],
+          getSieveScript: ['domain_id', 'alias_id', 'script_id'],
+          updateSieveScript: ['domain_id', 'alias_id', 'script_id'],
+          deleteSieveScript: ['domain_id', 'alias_id', 'script_id'],
+          activateSieveScript: ['domain_id', 'alias_id', 'script_id'],
+          getContact: ['id'],
+          updateContact: ['id'],
+          deleteContact: ['id'],
+          getCalendar: ['id'],
+          updateCalendar: ['id'],
+          deleteCalendar: ['id'],
+          getCalendarEvent: ['id'],
+          updateCalendarEvent: ['id'],
+          deleteCalendarEvent: ['id'],
+          getEmail: ['id'],
+          deleteEmail: ['id'],
+          getMessage: ['id'],
+          updateMessage: ['id'],
+          deleteMessage: ['id'],
+          getFolder: ['id'],
+          updateFolder: ['id'],
+          deleteFolder: ['id'],
+          getSieveScriptAliasAuth: ['script_id'],
+          updateSieveScriptAliasAuth: ['script_id'],
+          deleteSieveScriptAliasAuth: ['script_id'],
+          activateSieveScriptAliasAuth: ['script_id'],
+        };
+
+        for (const [toolName, expectedParameters] of Object.entries(
+          toolsWithPathParameters,
+        )) {
+          const tool = result.tools.find((t) => t.name === toolName);
+          assert(tool, `Tool ${toolName} not found`);
+
+          for (const parameter of expectedParameters) {
+            assert(
+              tool.inputSchema.properties[parameter],
+              `${toolName} missing property definition for path param "${parameter}"`,
+            );
+            assert(
+              tool.inputSchema.required.includes(parameter),
+              `${toolName} should have "${parameter}" in required array`,
+            );
+          }
+        }
+      } finally {
+        killChild(child);
+      }
+    },
+  );
+
+  await t.test(
+    'tools with query params have those params in properties',
+    async () => {
+      const child = runCli();
+      try {
+        await initializeServer(child);
+        const result = await listTools(child);
+
+        // Spot-check: tools that have query params should have them as properties
+        const toolsWithQueryParameters = {
+          downloadLogs: ['domain', 'q'],
+          listDomains: ['sort', 'page', 'limit'],
+          listAliases: ['sort', 'page', 'limit'],
+          listEmails: ['q', 'domain', 'sort', 'page', 'limit'],
+          listMessages: ['folder', 'subject', 'q', 'metadata_only'],
+          getMessage: ['eml', 'attachments'],
+          listFolders: ['subscribed'],
+        };
+
+        for (const [toolName, expectedParameters] of Object.entries(
+          toolsWithQueryParameters,
+        )) {
+          const tool = result.tools.find((t) => t.name === toolName);
+          assert(tool, `Tool ${toolName} not found`);
+
+          for (const parameter of expectedParameters) {
+            assert(
+              tool.inputSchema.properties[parameter],
+              `${toolName} missing property definition for query param "${parameter}"`,
+            );
+          }
+        }
+      } finally {
+        killChild(child);
+      }
+    },
+  );
+
+  await t.test(
+    'listMessages exposes Anthropic result-size metadata and metadata_only input',
+    async () => {
+      const child = runCli();
+      try {
+        await initializeServer(child);
+        const result = await listTools(child);
+        const listMessagesTool = result.tools.find(
+          (tool) => tool.name === 'listMessages',
+        );
+
+        assert(listMessagesTool, 'Tool listMessages not found');
+        assert.strictEqual(
+          listMessagesTool._meta['anthropic/maxResultSizeChars'],
+          500_000,
+        );
+        assert.strictEqual(
+          listMessagesTool.inputSchema.properties.metadata_only.type,
+          'boolean',
+        );
+      } finally {
+        killChild(child);
+      }
+    },
+  );
+
+  await t.test(
+    'listMessages metadata_only strips body and attachment content',
+    async () => {
+      const originalCreate = axios.create;
+      axios.create = () => ({
+        get: async () => ({
+          data: {
+            results: [
+              {
+                id: 'msg_1',
+                uid: 123,
+                subject: 'Hello',
+                from: [{address: 'sender@example.com'}],
+                to: [{address: 'user@example.com'}],
+                date: '2026-04-08T00:00:00.000Z',
+                size: 42,
+                has_attachment: true,
+                flags: ['\\Seen'],
+                folder: 'INBOX',
+                text: 'hidden body',
+                html: '<p>hidden body</p>',
+                attachments: [{filename: 'secret.txt', content: 'hidden'}],
+              },
+            ],
+          },
+        }),
+      });
+
+      try {
+        const tools = getTools();
+        const result = await tools.listMessages.invoke({
+          folder: 'INBOX',
+          alias_username: 'test@example.com',
+          alias_password: 'fake-password',
+          metadata_only: true,
+        });
+
+        assert.deepStrictEqual(result, {
+          results: [
+            {
+              id: 'msg_1',
+              uid: 123,
+              subject: 'Hello',
+              from: [{address: 'sender@example.com'}],
+              to: [{address: 'user@example.com'}],
+              date: '2026-04-08T00:00:00.000Z',
+              size: 42,
+              has_attachment: true,
+              flags: ['\\Seen'],
+              folder: 'INBOX',
+            },
+          ],
+        });
+      } finally {
+        axios.create = originalCreate;
+      }
+    },
+  );
+
+  await t.test(
+    'listMessages automatically trims oversized results to metadata-only output',
+    async () => {
+      const originalCreate = axios.create;
+      axios.create = () => ({
+        get: async () => ({
+          data: {
+            results: [
+              {
+                id: 'msg_1',
+                uid: 123,
+                subject: 'Hello',
+                from: [{address: 'sender@example.com'}],
+                to: [{address: 'user@example.com'}],
+                date: '2026-04-08T00:00:00.000Z',
+                size: 42,
+                has_attachment: true,
+                flags: ['\\Seen'],
+                folder: 'INBOX',
+                text: 'x'.repeat(600_000),
+                attachments: [
+                  {
+                    filename: 'secret.txt',
+                    content: 'y'.repeat(10_000),
+                  },
+                ],
+              },
+            ],
+          },
+        }),
+      });
+
+      try {
+        const tools = getTools();
+        const result = await tools.listMessages.invoke({
+          folder: 'INBOX',
+          alias_username: 'test@example.com',
+          alias_password: 'fake-password',
+        });
+
+        assert.deepStrictEqual(result, {
+          results: [
+            {
+              id: 'msg_1',
+              uid: 123,
+              subject: 'Hello',
+              from: [{address: 'sender@example.com'}],
+              to: [{address: 'user@example.com'}],
+              date: '2026-04-08T00:00:00.000Z',
+              size: 42,
+              has_attachment: true,
+              flags: ['\\Seen'],
+              folder: 'INBOX',
+            },
+          ],
+        });
+      } finally {
+        axios.create = originalCreate;
+      }
+    },
+  );
+
+  await t.test('every property has a type and description', async () => {
+    const child = runCli();
+    try {
+      await initializeServer(child);
+      const result = await listTools(child);
+
+      for (const tool of result.tools) {
+        for (const [propertyName, propertyDefinition] of Object.entries(
+          tool.inputSchema.properties,
+        )) {
+          assert(
+            propertyDefinition.type,
+            `${tool.name}.${propertyName} missing type`,
+          );
+          assert(
+            propertyDefinition.description &&
+              propertyDefinition.description.length > 0,
+            `${tool.name}.${propertyName} missing or empty description`,
+          );
+        }
+      }
+    } finally {
+      killChild(child);
+    }
+  });
+
+  //
+  // Body parameter schema verification for POST/PUT tools
+  //
+  await t.test(
+    'POST/PUT tools have body parameter properties in their schemas',
+    async () => {
+      const child = runCli();
+      try {
+        await initializeServer(child);
+        const result = await listTools(child);
+
+        // Map of tool name -> expected body parameter names (at minimum)
+        // Only includes tools whose body params are documented in the official API docs.
+        const expectedBodyParameters = {
+          // Account
+          updateAccount: ['given_name', 'family_name'],
+
+          // Domains
+          createDomain: ['domain', 'plan'],
+          updateDomain: ['smtp_port', 'has_adult_content_protection'],
+
+          // Catch-all passwords
+          createCatchAllPassword: ['new_password'],
+
+          // Domain invites
+          createDomainInvite: ['email', 'group'],
+
+          // Domain members
+          updateDomainMember: ['group'],
+
+          // Aliases
+          createAlias: ['name', 'recipients', 'description'],
+          updateAlias: ['name', 'recipients', 'description'],
+
+          // Alias password
+          generateAliasPassword: ['new_password'],
+
+          // Emails (SMTP)
+          sendEmail: ['from', 'to', 'subject', 'text', 'html'],
+
+          // Encrypt
+          encryptRecord: ['input'],
+
+          // Activate sieve scripts (alias auth) — POST but no body expected
+          // activateSieveScript / activateSieveScriptAliasAuth — activation is path-only
+
+          // Test S3 connection — POST but body params are domain-config level
+          testS3Connection: [],
+        };
+
+        for (const [toolName, expectedParameters] of Object.entries(
+          expectedBodyParameters,
+        )) {
+          const tool = result.tools.find((t) => t.name === toolName);
+          assert(tool, `Tool ${toolName} not found`);
+
+          for (const parameter of expectedParameters) {
+            assert(
+              tool.inputSchema.properties[parameter],
+              `${toolName} missing body parameter "${parameter}" in inputSchema.properties`,
+            );
+            // Body params should have type and description
+            assert(
+              tool.inputSchema.properties[parameter].type,
+              `${toolName}.${parameter} missing type`,
+            );
+            assert(
+              tool.inputSchema.properties[parameter].description &&
+                tool.inputSchema.properties[parameter].description.length > 0,
+              `${toolName}.${parameter} missing or empty description`,
+            );
+          }
+        }
+      } finally {
+        killChild(child);
+      }
+    },
+  );
+
+  await t.test(
+    'tools with required body params include them in required array',
+    async () => {
+      const child = runCli();
+      try {
+        await initializeServer(child);
+        const result = await listTools(child);
+
+        // Tools where certain body params should be required
+        const toolsWithRequiredBodyParameters = {
+          createDomain: ['domain'],
+          createDomainInvite: ['email', 'group'],
+          updateDomainMember: ['group'],
+          encryptRecord: ['input'],
+        };
+
+        for (const [toolName, requiredParameters] of Object.entries(
+          toolsWithRequiredBodyParameters,
+        )) {
+          const tool = result.tools.find((t) => t.name === toolName);
+          assert(tool, `Tool ${toolName} not found`);
+
+          for (const parameter of requiredParameters) {
+            assert(
+              tool.inputSchema.required.includes(parameter),
+              `${toolName} should have "${parameter}" in required array`,
+            );
+          }
+        }
+      } finally {
+        killChild(child);
+      }
+    },
+  );
+
+  await t.test(
+    'sendEmail has comprehensive email composition properties',
+    async () => {
+      const child = runCli();
+      try {
+        await initializeServer(child);
+        const result = await listTools(child);
+
+        const tool = result.tools.find((t) => t.name === 'sendEmail');
+        assert(tool, 'sendEmail tool not found');
+
+        const emailProperties = [
+          'from',
+          'to',
+          'cc',
+          'bcc',
+          'subject',
+          'text',
+          'html',
+          'attachments',
+          'replyTo',
+          'inReplyTo',
+          'references',
+        ];
+
+        for (const property of emailProperties) {
+          assert(
+            tool.inputSchema.properties[property],
+            `sendEmail missing "${property}" property`,
+          );
+        }
+      } finally {
+        killChild(child);
+      }
+    },
+  );
+
+  await t.test('createAlias has vacation responder properties', async () => {
+    const child = runCli();
+    try {
+      await initializeServer(child);
+      const result = await listTools(child);
+
+      const tool = result.tools.find((t) => t.name === 'createAlias');
+      assert(tool, 'createAlias tool not found');
+
+      const vacationProperties = [
+        'vacation_responder_is_enabled',
+        'vacation_responder_message',
+      ];
+
+      for (const property of vacationProperties) {
+        assert(
+          tool.inputSchema.properties[property],
+          `createAlias missing "${property}" property`,
+        );
+      }
+    } finally {
+      killChild(child);
+    }
+  });
 
   // Encrypt endpoint doesn't require auth, so test for success
   await t.test('encryptRecord returns a result', async () => {
